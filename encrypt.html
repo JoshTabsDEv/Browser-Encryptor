@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Browser Encryptor — RSA + AES (Hybrid)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 24px; background:#f7f9fc; color:#111; display:flex; flex-direction:column; min-height:100vh; }
+    h1 { margin: 0 0 12px 0; font-size: 20px; }
+    .card { background:white; padding:16px; border-radius:8px; box-shadow: 0 6px 18px rgba(20,40,60,0.06); margin-bottom:16px; }
+    textarea { width:100%; height:120px; font-family: monospace; font-size:13px; }
+    input[type=file]{display:block; margin-top:8px;}
+    label{font-weight:600;}
+    .row{display:flex; gap:12px; flex-wrap:wrap}
+    button{padding:8px 12px; border-radius:6px; border:0; background:#0366d6; color:white; cursor:pointer;}
+    button.secondary{background:#6c757d;}
+    .small{font-size:13px; color:#555;}
+    pre{white-space:pre-wrap; word-wrap:break-word}
+    .status{margin-top:8px; color:#1a73e8}
+    footer { background:#111; color:#fff; text-align:center; padding:12px 0; font-size:14px; margin-top:auto; border-radius:8px; }
+  </style>
+</head>
+<body>
+
+  <h1>Browser Encryptor — RSA (public/private) + AES-GCM (hybrid)</h1>
+
+  <div class="card">
+    <div class="row" style="align-items:center;">
+      <div>
+        <label>Generate RSA Key Pair (2048, RSA-OAEP/SHA-256)</label>
+        <div class="small">Use this to produce a public key to share and a private key to keep secret.</div>
+      </div>
+      <div>
+        <button id="genKeysBtn">Generate Key Pair</button>
+      </div>
+    </div>
+
+    <hr/>
+
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+      <div>
+        <label>Public Key (SPKI PEM) — share this</label>
+        <textarea id="publicKeyPem" placeholder="Public key will appear here (SPKI PEM)"></textarea>
+        <div class="row" style="margin-top:8px;">
+          <button id="copyPubBtn" class="secondary">Copy Public PEM</button>
+          <button id="downloadPubBtn" class="secondary">Download Public Key</button>
+        </div>
+      </div>
+
+      <div>
+        <label>Private Key (PKCS8 PEM) — keep this secret</label>
+        <textarea id="privateKeyPem" placeholder="Private key will appear here (PKCS8 PEM)"></textarea>
+        <div class="row" style="margin-top:8px;">
+          <button id="copyPrivBtn" class="secondary">Copy Private PEM</button>
+          <button id="downloadPrivBtn" class="secondary">Download Private Key</button>
+        </div>
+      </div>
+    </div>
+    <div class="small" style="margin-top:8px">You can also paste existing PEM keys into these boxes before encrypting/decrypting.</div>
+  </div>
+
+  <div class="card">
+    <label>Encrypt a file using a Public Key</label>
+    <div class="small">If you want to encrypt a file for someone, paste their <strong>public key PEM</strong> into the Public Key box (left) first.</div>
+
+    <input type="file" id="encryptFileInput"/>
+    <div class="row" style="margin-top:10px;">
+      <button id="encryptBtn">Encrypt Selected File</button>
+      <button id="encryptDownloadBtn" class="secondary" disabled>Download Encrypted (when ready)</button>
+    </div>
+    <div id="encryptStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <label>Decrypt a file using a Private Key</label>
+    <div class="small">Paste your <strong>private key PEM</strong> into the Private Key box (right) prior to decrypting.</div>
+
+    <input type="file" id="decryptFileInput" accept=".enc,application/json"/>
+    <div class="row" style="margin-top:10px;">
+      <button id="decryptBtn">Decrypt Selected Encrypted File</button>
+      <button id="decryptDownloadBtn" class="secondary" disabled>Download Decrypted (when ready)</button>
+    </div>
+    <div id="decryptStatus" class="status"></div>
+  </div>
+
+  <!-- ✅ Footer -->
+  <footer>© 2025 Joshua Tabura. All rights reserved.</footer>
+
+  <script>
+  // Helper utilities: base64 <-> ArrayBuffer
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+  function base64ToArrayBuffer(b64) {
+    const binary = atob(b64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  // PEM helpers: export/import RSA keys to/from PEM format
+  function ab2str(buf) { return new TextDecoder().decode(buf); }
+  function str2ab(str) { return new TextEncoder().encode(str); }
+
+  async function exportPublicKeyToPEM(publicKey) {
+    const spki = await crypto.subtle.exportKey('spki', publicKey);
+    const b64 = arrayBufferToBase64(spki);
+    return `-----BEGIN PUBLIC KEY-----\n${b64.match(/.{1,64}/g).join('\n')}\n-----END PUBLIC KEY-----`;
+  }
+
+  async function exportPrivateKeyToPEM(privateKey) {
+    const pkcs8 = await crypto.subtle.exportKey('pkcs8', privateKey);
+    const b64 = arrayBufferToBase64(pkcs8);
+    return `-----BEGIN PRIVATE KEY-----\n${b64.match(/.{1,64}/g).join('\n')}\n-----END PRIVATE KEY-----`;
+  }
+
+  function pemToArrayBuffer(pem) {
+    const b64 = pem.replace(/-----(BEGIN|END)[\w\s]+-----/g, '').replace(/\s+/g, '');
+    return base64ToArrayBuffer(b64);
+  }
+
+  async function importPublicKeyFromPEM(pem) {
+    const ab = pemToArrayBuffer(pem);
+    return crypto.subtle.importKey('spki', ab, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']);
+  }
+
+  async function importPrivateKeyFromPEM(pem) {
+    const ab = pemToArrayBuffer(pem);
+    return crypto.subtle.importKey('pkcs8', ab, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['decrypt']);
+  }
+
+  // UI elements
+  const genKeysBtn = document.getElementById('genKeysBtn');
+  const publicPemTa = document.getElementById('publicKeyPem');
+  const privatePemTa = document.getElementById('privateKeyPem');
+  const copyPubBtn = document.getElementById('copyPubBtn');
+  const copyPrivBtn = document.getElementById('copyPrivBtn');
+  const downloadPubBtn = document.getElementById('downloadPubBtn');
+  const downloadPrivBtn = document.getElementById('downloadPrivBtn');
+
+  const encryptFileInput = document.getElementById('encryptFileInput');
+  const encryptBtn = document.getElementById('encryptBtn');
+  const encryptStatus = document.getElementById('encryptStatus');
+  const encryptDownloadBtn = document.getElementById('encryptDownloadBtn');
+
+  const decryptFileInput = document.getElementById('decryptFileInput');
+  const decryptBtn = document.getElementById('decryptBtn');
+  const decryptStatus = document.getElementById('decryptStatus');
+  const decryptDownloadBtn = document.getElementById('decryptDownloadBtn');
+
+  // In-memory stored keys
+  let cachedPublicKey = null;
+  let cachedPrivateKey = null;
+  let lastEncryptedBlob = null;
+  let lastDecryptedBlob = null;
+
+  // Generate RSA key pair
+  genKeysBtn.addEventListener('click', async () => {
+    genKeysBtn.disabled = true;
+    genKeysBtn.textContent = 'Generating... (this can take a few seconds)';
+    try {
+      const kp = await crypto.subtle.generateKey(
+        { name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([0x01,0x00,0x01]), hash: 'SHA-256' },
+        true,
+        ['encrypt', 'decrypt']
+      );
+      const pubPem = await exportPublicKeyToPEM(kp.publicKey);
+      const privPem = await exportPrivateKeyToPEM(kp.privateKey);
+      publicPemTa.value = pubPem;
+      privatePemTa.value = privPem;
+      cachedPublicKey = kp.publicKey;
+      cachedPrivateKey = kp.privateKey;
+      encryptStatus.textContent = 'Key pair generated. Public and Private PEM are filled above.';
+      decryptStatus.textContent = '';
+    } catch (err) {
+      encryptStatus.textContent = 'Error generating keys: ' + err.message;
+    } finally {
+      genKeysBtn.disabled = false;
+      genKeysBtn.textContent = 'Generate Key Pair';
+    }
+  });
+
+  // Copy and download keys
+  copyPubBtn.addEventListener('click', () => navigator.clipboard.writeText(publicPemTa.value));
+  copyPrivBtn.addEventListener('click', () => navigator.clipboard.writeText(privatePemTa.value));
+
+  downloadPubBtn.addEventListener('click', () => {
+    const blob = new Blob([publicPemTa.value], {type:'application/x-pem-file'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'public_key.pem';
+    a.click();
+  });
+  downloadPrivBtn.addEventListener('click', () => {
+    const blob = new Blob([privatePemTa.value], {type:'application/x-pem-file'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'private_key.pem';
+    a.click();
+  });
+
+  // Re-import keys on paste/change
+  publicPemTa.addEventListener('change', async () => {
+    const v = publicPemTa.value.trim();
+    if (!v) { cachedPublicKey = null; return; }
+    try {
+      cachedPublicKey = await importPublicKeyFromPEM(v);
+      encryptStatus.textContent = 'Public key loaded from PEM.';
+    } catch (err) {
+      encryptStatus.textContent = 'Public key import error: ' + err.message;
+    }
+  });
+
+  privatePemTa.addEventListener('change', async () => {
+    const v = privatePemTa.value.trim();
+    if (!v) { cachedPrivateKey = null; return; }
+    try {
+      cachedPrivateKey = await importPrivateKeyFromPEM(v);
+      decryptStatus.textContent = 'Private key loaded from PEM.';
+    } catch (err) {
+      decryptStatus.textContent = 'Private key import error: ' + err.message;
+    }
+  });
+
+  // ENCRYPT
+  encryptBtn.addEventListener('click', async () => {
+    encryptStatus.textContent = '';
+    encryptDownloadBtn.disabled = true;
+    const file = encryptFileInput.files[0];
+    if (!file) { encryptStatus.textContent = 'Select a file to encrypt.'; return; }
+
+    if (!cachedPublicKey) {
+      const pem = publicPemTa.value.trim();
+      if (!pem) { encryptStatus.textContent = 'Paste or generate the recipient public key PEM first.'; return; }
+      try {
+        cachedPublicKey = await importPublicKeyFromPEM(pem);
+      } catch (err) {
+        encryptStatus.textContent = 'Public key import error: ' + err.message;
+        return;
+      }
+    }
+
+    encryptStatus.textContent = 'Reading file...';
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const aesKey = await crypto.subtle.generateKey({name:'AES-GCM', length:256}, true, ['encrypt','decrypt']);
+      const rawAes = await crypto.subtle.exportKey('raw', aesKey);
+      const encryptedAesKey = await crypto.subtle.encrypt({name:'RSA-OAEP'}, cachedPublicKey, rawAes);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ciphertext = await crypto.subtle.encrypt({name:'AES-GCM', iv: iv}, aesKey, arrayBuffer);
+
+      const payload = {
+        filename: file.name,
+        algorithm: 'RSA-OAEP+AES-GCM',
+        encryptedKey: arrayBufferToBase64(encryptedAesKey),
+        iv: arrayBufferToBase64(iv.buffer),
+        ciphertext: arrayBufferToBase64(ciphertext)
+      };
+
+      const blob = new Blob([JSON.stringify(payload)], {type: 'application/json'});
+      const url = URL.createObjectURL(blob);
+      encryptDownloadBtn.onclick = () => {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = file.name + '.enc';
+        a.click();
+      };
+      encryptDownloadBtn.disabled = false;
+      encryptStatus.textContent = `Encrypted ${file.name} — ready to download.`;
+    } catch (err) {
+      encryptStatus.textContent = 'Encryption failed: ' + (err.message || err);
+    }
+  });
+
+  // DECRYPT
+  decryptBtn.addEventListener('click', async () => {
+    decryptStatus.textContent = '';
+    decryptDownloadBtn.disabled = true;
+    const file = decryptFileInput.files[0];
+    if (!file) { decryptStatus.textContent = 'Select the .enc file to decrypt.'; return; }
+
+    if (!cachedPrivateKey) {
+      const pem = privatePemTa.value.trim();
+      if (!pem) { decryptStatus.textContent = 'Paste or generate your private key PEM first.'; return; }
+      try {
+        cachedPrivateKey = await importPrivateKeyFromPEM(pem);
+      } catch (err) {
+        decryptStatus.textContent = 'Private key import error: ' + err.message;
+        return;
+      }
+    }
+
+    decryptStatus.textContent = 'Reading encrypted file...';
+    try {
+      const txt = await file.text();
+      const payload = JSON.parse(txt);
+
+      if (!payload.encryptedKey || !payload.iv || !payload.ciphertext) {
+        decryptStatus.textContent = 'Invalid encrypted file format.';
+        return;
+      }
+
+      const encryptedKeyBuf = base64ToArrayBuffer(payload.encryptedKey);
+      const rawAes = await crypto.subtle.decrypt({name:'RSA-OAEP'}, cachedPrivateKey, encryptedKeyBuf);
+      const aesKey = await crypto.subtle.importKey('raw', rawAes, {name:'AES-GCM'}, false, ['decrypt']);
+      const iv = base64ToArrayBuffer(payload.iv);
+      const ciphertextBuf = base64ToArrayBuffer(payload.ciphertext);
+      const decrypted = await crypto.subtle.decrypt({name:'AES-GCM', iv:new Uint8Array(iv)}, aesKey, ciphertextBuf);
+
+      const blob = new Blob([decrypted]);
+      const url = URL.createObjectURL(blob);
+      decryptDownloadBtn.onclick = () => {
+        const a = document.createElement('a');
+        a.href = url;
+        const outName = (payload.filename ? payload.filename.replace(/\.enc$/,'') : 'decrypted.bin');
+        a.download = outName;
+        a.click();
+      };
+      decryptDownloadBtn.disabled = false;
+      decryptStatus.textContent = `Decrypted — ready to download (${payload.filename || 'file'}).`;
+    } catch (err) {
+      decryptStatus.textContent = 'Decryption failed: ' + (err.message || err);
+    }
+  });
+
+  // Auto import on paste
+  publicPemTa.addEventListener('paste', () => setTimeout(()=> publicPemTa.dispatchEvent(new Event('change')), 50));
+  privatePemTa.addEventListener('paste', () => setTimeout(()=> privatePemTa.dispatchEvent(new Event('change')), 50));
+  </script>
+
+</body>
+</html>
